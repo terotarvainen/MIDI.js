@@ -15,29 +15,37 @@ if (typeof (MIDI.Player) === "undefined") MIDI.Player = {};
 
 var root = MIDI.Player;
 root.callback = undefined; // your custom callback goes here!
-root.currentTime = 0;
-root.endTime = 0; 
-root.restart = 0; 
+root.restart = 0;
 root.playing = false;
 root.timeWarp = 1;
+root.currentTick = 0;
+root.endTick = 0;
+root.playbackSpeedCoef = 1;
+root.animationCallback = undefined;
+root.currentPlaybackTick = 0;
+root.lastNotedMidiTick = 0;
 
-//
 root.start =
 root.resume = function () {
-	if (root.currentTime < -1) root.currentTime = -1;
-	startAudio(root.currentTime);
+
+	startAudio(root.currentTick);
+
+	if ( root.animationCallback ) {
+		root.animating = true;
+		root.animationFrame();
+	}
 };
 
 root.pause = function () {
-	var tmp = root.restart;
 	stopAudio();
-	root.restart = tmp;
+	root.animating = false;
 };
 
 root.stop = function () {
 	stopAudio();
 	root.restart = 0;
-	root.currentTime = 0;
+	root.currentTick = 0;
+	root.animating = false;
 };
 
 root.addListener = function(callback) {
@@ -48,58 +56,61 @@ root.removeListener = function() {
 	onMidiEvent = undefined;
 };
 
-root.clearAnimation = function() {
-	if (root.interval)  {
-		window.clearInterval(root.interval);
+root.registerAnimationCallback = function( callback ) {
+	root.animationCallback = callback;
+};
+
+root.setPlaybackTempo = function(playbackSpeed) {
+
+	var restart = root.playing;
+	if ( root.playing ) {
+		stopAudio();
+	}
+	root.playbackSpeedCoef = playbackSpeed;
+	if ( restart ) {
+		startAudio(root.currentTick);
 	}
 };
 
-root.setAnimation = function(config) {
-	var callback = (typeof(config) === "function") ? config : config.callback;
-	var interval = config.interval || 30;
-	var currentTime = 0;
-	var tOurTime = 0;
-	var tTheirTime = 0;
-	//
-	root.clearAnimation();
-	root.interval = window.setInterval(function () {
-		if (root.endTime === 0) return;
-		if (root.playing) {
-			currentTime = (tTheirTime === root.currentTime) ? tOurTime - (new Date).getTime() : 0;
-			if (root.currentTime === 0) {
-				currentTime = 0;
-			} else {
-				currentTime = root.currentTime - currentTime;
-			}
-			if (tTheirTime !== root.currentTime) {
-				tOurTime = (new Date).getTime();
-				tTheirTime = root.currentTime;
-			}
-		} else { // paused
-			currentTime = root.currentTime;
-		}
-		var endTime = root.endTime;
-		var percent = currentTime / endTime;
-		var total = currentTime / 1000;
-		var minutes = total / 60;
-		var seconds = total - (minutes * 60);
-		var t1 = minutes * 60 + seconds;
-		var t2 = (endTime / 1000);
-		if (t2 - t1 < -1) return;
-		callback({
-			now: t1,
-			end: t2,
-			events: noteRegistrar
-		});
-	}, interval);
+root.animationFrame = function () {
+
+	if ( root.endTick === 0 ) return;
+	if ( !root.animating ) return;
+
+	var ctx = getContext();
+	if ( root.lastNotedMidiTick === root.currentTick ) {
+		root.currentPlaybackTick = root.lastNotedMidiTick + timeToTick(ctx.currentTime - root.lastPlaybackTimeMarker);
+	} else {
+		root.currentPlaybackTick = root.currentTick;
+		root.lastNotedMidiTick = root.currentTick;
+		root.lastPlaybackTimeMarker = ctx.currentTime;
+	}
+
+	if ( root.currentPlaybackTick )
+		root.reportAnimation();
+
+	if ( root.animating ) {
+		window.requestAnimationFrame(root.animationFrame);
+	}
+};
+
+root.reportAnimation = function() {
+	root.animationCallback({
+		percentage: root.currentTick / root.endTick,
+		tick: root.currentPlaybackTick,
+		endTick: root.endTick,
+		time: tickToTimeAnimatedConverter,
+		events: noteRegistrar
+	});
 };
 
 // helpers
-
 root.loadMidiFile = function() { // reads midi into javascript array of events
 	root.replayer = new Replayer(MidiFile(root.currentData), root.timeWarp);
 	root.data = root.replayer.getData();
-	root.endTime = getLength();
+	root.header = root.replayer.getHeader();
+	root.ticksPerSecond = resolveTempo( root.data, root.header );
+	root.endTick = getLength(root.data);
 };
 
 root.loadFile = function (file, callback) {
@@ -133,24 +144,58 @@ root.loadFile = function (file, callback) {
 	fetch.send();
 };
 
-// Playing the audio
+/**
+ * Resolve song tempo.
+ * Note: Tempo changes in the MIDI file are not currently supported.
+ * @return ticksPerSecond
+ */
+function resolveTempo( midiData, header ) {
+	// Find the first setTempo event and return its value.
+	for ( var i = 0; i < midiData.length; i++ ) {
+		var data = midiData[i][0];
+		if ( data.event.subtype == "setTempo" ) {
+			return root.header.ticksPerBeat/(data.event.microsecondsPerBeat/1000000);
+		}
+	}
+}
 
+function timeToTick(time) {
+	var tick = Math.ceil(time*root.ticksPerSecond/root.playbackSpeedCoef);
+	return tick;
+}
+
+function tickToTime(tick) {
+	var time = tick*root.playbackSpeedCoef/root.ticksPerSecond;
+	return time;
+}
+
+function tickToTimeAnimatedConverter() {
+	return {
+		now: tickToTime(root.currentPlaybackTick),
+		end: tickToTime(root.endTick)
+	};
+}
+
+// Playing the audio
 var eventQueue = []; // hold events to be triggered
-var queuedTime; // 
-var startTime = 0; // to measure time elapse
-var noteRegistrar = {}; // get event for requested note
+var lastTickOfCurrentPatch = 0; // The tick time of the last event scheduled for playing. Used to trigger loading of next sequence.
+var startTime = 0; // to measure time elapse in relation to audio context timer. See getContext().currentTime.
+var noteRegistrar = {}; // contains currently active notes
 var onMidiEvent = undefined; // listener callback
-var scheduleTracking = function (channel, note, currentTime, offset, message, velocity) {
+var scheduleTracking = function (channel, note, currentTime, currentTick, offset, message, velocity) {
+
 	var interval = window.setTimeout(function () {
 		var data = {
 			channel: channel,
 			note: note,
+			tick: currentTick,
+			endTick: root.endTick,
 			now: currentTime,
-			end: root.endTime,
+			end: tickToTime(root.endTick),
 			message: message,
 			velocity: velocity
 		};
-		//
+
 		if (message === 128) {
 			delete noteRegistrar[note];
 		} else {
@@ -159,9 +204,10 @@ var scheduleTracking = function (channel, note, currentTime, offset, message, ve
 		if (onMidiEvent) {
 			onMidiEvent(data);
 		}
-		root.currentTime = currentTime;
-		if (root.currentTime === queuedTime && queuedTime < root.endTime) { // grab next sequence
-			startAudio(queuedTime, true);
+
+		root.currentTick = currentTick;
+		if (root.currentTick === lastTickOfCurrentPatch && lastTickOfCurrentPatch < root.endTick) { // grab next sequence
+			startAudioTT(queuedTick, true);
 		}
 	}, currentTime - offset);
 	return interval;
@@ -176,38 +222,42 @@ var getContext = function() {
 	return root.ctx;
 };
 
-var getLength = function() {
-	var data =  root.data;
+var getLength = function(data) {
 	var length = data.length;
-	var totalTime = 0.5;
+	var totalTicks = 0;
 	for (var n = 0; n < length; n++) {
-		totalTime += data[n][1];
+		totalTicks += data[n][0].ticksToEvent;;
 	}
-	return totalTime;
+	return totalTicks;
 };
 
-var startAudio = function (currentTime, fromCache) {
+var startAudio = function (currentTick, continuousPlay) {
+
 	if (!root.replayer) return;
-	if (!fromCache) {
-		if (typeof (currentTime) === "undefined") currentTime = root.restart;
+
+	if ( !continuousPlay ) {
 		if (root.playing) stopAudio();
 		root.playing = true;
-		root.data = root.replayer.getData();
-		root.endTime = getLength();
 	}
+
 	var note;
+	var queuedTime = 0;
+	var queuedTick = 0;
+	var currentTime = 0;
 	var offset = 0;
 	var messages = 0;
-	var data = root.data;	
+	var data = root.data;
 	var ctx = getContext();
 	var length = data.length;
-	//
-	queuedTime = 0.5;
+
 	startTime = ctx.currentTime;
-	//
+	root.lastPlaybackTimeMarker = startTime;
+	root.lastNotedMidiTick = -1;
+
 	for (var n = 0; n < length && messages < 100; n++) {
-		queuedTime += data[n][1];
-		if (queuedTime < currentTime) {
+		queuedTime += root.playbackSpeedCoef * data[n][1];
+		queuedTick += data[n][0].ticksToEvent;
+		if ( queuedTick < currentTick ) {
 			offset = queuedTime;
 			continue;
 		}
@@ -222,7 +272,7 @@ var startAudio = function (currentTime, fromCache) {
 				eventQueue.push({
 					event: event,
 					source: MIDI.noteOn(channel, event.noteNumber, event.velocity, currentTime / 1000 + ctx.currentTime),
-					interval: scheduleTracking(channel, note, queuedTime, offset, 144, event.velocity)
+					interval: scheduleTracking(channel, note, queuedTime, queuedTick, offset, 144, event.velocity)
 				});
 				messages ++;
 				break;
@@ -232,13 +282,14 @@ var startAudio = function (currentTime, fromCache) {
 				eventQueue.push({
 					event: event,
 					source: MIDI.noteOff(channel, event.noteNumber, currentTime / 1000 + ctx.currentTime),
-					interval: scheduleTracking(channel, note, queuedTime, offset, 128)
+					interval: scheduleTracking(channel, note, queuedTime, queuedTick, offset, 128)
 				});
 				break;
 			default:
 				break;
 		}
 	}
+	lastTickOfCurrentPatch = queuedTick;
 };
 
 var stopAudio = function () {
@@ -258,13 +309,14 @@ var stopAudio = function () {
 	}
 	// run callback to cancel any notes still playing
 	for (var key in noteRegistrar) {
-		var o = noteRegistrar[key]
+		var o = noteRegistrar[key];
 		if (noteRegistrar[key].message === 144 && onMidiEvent) {
 			onMidiEvent({
 				channel: o.channel,
 				note: o.note,
+				tick: o.tick,
 				now: o.now,
-				end: o.end,
+				end: o.end*root.playbackSpeedCoef,
 				message: 128,
 				velocity: o.velocity
 			});

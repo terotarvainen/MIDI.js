@@ -91,6 +91,9 @@ function Replayer(midiFile, timeWarp, eventProcessor) {
 	return {
 		"getData": function() {
 			return clone(temporal);
+		},
+		"getHeader": function() {
+			return midiFile.header;
 		}
 	};
 };
